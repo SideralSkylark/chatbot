@@ -1,9 +1,10 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
-from transformers import pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from sklearn.metrics.pairwise import cosine_similarity
-import uvicorn
+import torch
 
 # Dados pessoais
 docs = [
@@ -20,15 +21,38 @@ docs = [
     "Nos meus tempos livres gosto de jogar videojogos."
 ]
 
-# Carregar modelos
+# Carregar modelo de embeddings
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
-generator = pipeline("text2text-generation", model="google/flan-t5-base")
 
-# Pré-processar os embeddings dos documentos
+# Carregar modelo de linguagem (Gemma Instruct)
+tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-1b-it")
+model = AutoModelForCausalLM.from_pretrained(
+    "google/gemma-3-1b-it",
+    torch_dtype=torch.bfloat16
+)
+
+# Pipeline de geração
+generator = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    torch_dtype=torch.bfloat16,
+    device=-1  # ou -1 para CPU
+)
+
+# Gerar embeddings dos documentos
 doc_embeddings = embedder.encode(docs, normalize_embeddings=True)
 
 # FastAPI app
 app = FastAPI(title="Chatbot Sidik")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # ou ["http://127.0.0.1:5500"] se usares um servidor local
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class Question(BaseModel):
     question: str
@@ -40,29 +64,45 @@ def ask_question(payload: Question):
     # Embedding da pergunta
     q_embedding = embedder.encode([question], normalize_embeddings=True)
 
-    # Similaridade com todos os documentos
+    # Similaridade com os documentos
     scores = cosine_similarity(q_embedding, doc_embeddings)[0]
 
-    # Pegar os 4 mais relevantes
+    # Verificar se existe contexto relevante
+    max_score = scores.max()
+    threshold = 0.3  # Ajuste conforme necessidade
+
+    if max_score < threshold:
+        return {
+            "question": question,
+            "context": "",
+            "answer": "Desculpe, não tenho informação suficiente para responder a essa pergunta."
+        }
+
+    # Selecionar os 4 documentos mais relevantes
     top_k = 4
     top_indices = scores.argsort()[-top_k:][::-1]
     context = "\n".join([docs[i] for i in top_indices])
 
-    # Montar prompt melhorado
+    # Montar prompt
     prompt = f"""
-    Com base nas informações abaixo, responda à pergunta em português, de forma direta, clara e em primeira pessoa.
+Com base nas informações abaixo, responda à pergunta em português, de forma direta, clara e em primeira pessoa.
 
-    Informações:
-    {context}
+Informações:
+{context}
 
-    Pergunta: {question}
-    Resposta:
-    """.strip()
+Pergunta: {question}
+Resposta:
+""".strip()
 
-    # Gerar resposta
-    raw_output = generator(prompt, max_length=100, do_sample=False)[0]["generated_text"]
-    response = raw_output.replace(prompt, "").strip()
+    # Gerar resposta com o modelo, corrigindo warnings
+    output = generator(
+        prompt,
+        max_new_tokens=150,
+        do_sample=False,
+        top_p=1.0,
+        top_k=0
+    )[0]["generated_text"]
+
+    response = output.replace(prompt, "").strip()
 
     return {"question": question, "context": context, "answer": response}
-
-# Rodar com: uvicorn modelo:app --reload
